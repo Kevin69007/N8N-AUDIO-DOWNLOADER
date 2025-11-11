@@ -2,14 +2,51 @@ const express = require('express');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+
 const app = express();
 
-app.use(express.json());
+// Middleware de base avec gestion d'erreurs
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
+// Timeout middleware
+app.use((req, res, next) => {
+  req.setTimeout(300000); // 5 minutes
+  res.setTimeout(300000);
+  next();
+});
+
+// Health check amélioré
+app.get('/health', (req, res) => {
+  try {
+    // Vérifier les dépendances système
+    const checks = {
+      node: process.version,
+      platform: process.platform,
+      memory: process.memoryUsage(),
+      uptime: process.uptime(),
+      tmpDir: fs.existsSync('/tmp') ? 'accessible' : 'not accessible'
+    };
+
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      checks
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error.message
+    });
+  }
+});
+
+// Info endpoint
 app.get('/', (req, res) => {
   res.json({
     service: 'Vimeo Audio Downloader API',
-    version: '2.2.0',
+    version: '2.2.1',
+    status: 'running',
     endpoints: {
       'GET /': 'API information',
       'GET /health': 'Health check',
@@ -18,8 +55,10 @@ app.get('/', (req, res) => {
   });
 });
 
-// Helper to extract video ID from various Vimeo URL formats
+// Helper functions
 function extractVideoId(url) {
+  if (!url) return null;
+  
   const patterns = [
     /vimeo\.com\/video\/(\d+)/,
     /player\.vimeo\.com\/video\/(\d+)/,
@@ -36,219 +75,221 @@ function extractVideoId(url) {
   return null;
 }
 
-// Helper to extract hash parameter
 function extractHash(url) {
   const match = url.match(/[?&]h=([a-f0-9]+)/);
   return match ? match[1] : null;
 }
 
+// Route principale avec gestion d'erreurs complète
 app.post('/download-audio', async (req, res) => {
-  const { vimeoUrl, videoId: providedVideoId, startTime, endTime } = req.body;
+  console.log('Download request received:', req.body);
   
-  if (!vimeoUrl) {
-    return res.status(400).json({ error: 'Missing vimeoUrl' });
-  }
-
-  const videoId = providedVideoId || extractVideoId(vimeoUrl);
-  const hash = extractHash(vimeoUrl);
-  
-  if (!videoId) {
-    return res.status(400).json({ error: 'Could not extract video ID from URL' });
-  }
-
-  console.log(`Processing video ${videoId}${hash ? ' with hash ' + hash : ''}`);
-  
-  const timestamp = Date.now();
-  const fullAudioPath = `/tmp/audio_${videoId}_${timestamp}.mp3`;
-  
-  // Build URLs to try with priority order
-  const urlsToTry = [];
-  
-  // If we have a hash, prioritize player URL with hash
-  if (hash) {
-    urlsToTry.push(`https://player.vimeo.com/video/${videoId}?h=${hash}`);
-    urlsToTry.push(vimeoUrl); // Original URL
-  } else {
-    urlsToTry.push(vimeoUrl); // Original URL first
-  }
-  
-  // Add standard formats as fallbacks
-  urlsToTry.push(`https://vimeo.com/${videoId}`);
-  urlsToTry.push(`https://player.vimeo.com/video/${videoId}`);
-
-  // Function to try downloading with a URL
-  const tryDownload = (url, index) => {
-    return new Promise((resolve, reject) => {
-      console.log(`Attempt ${index + 1}: Trying URL: ${url.substring(0, 80)}...`);
-      
-      // Enhanced yt-dlp command with aggressive retry options
-      const command = `yt-dlp \
-        --no-check-certificate \
-        --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-        --referer "https://vimeo.com/" \
-        --add-header "Accept: */*" \
-        --add-header "Accept-Language: en-US,en;q=0.9" \
-        --add-header "Sec-Fetch-Mode: navigate" \
-        --retries 3 \
-        --fragment-retries 3 \
-        -x --audio-format mp3 \
-        --audio-quality 0 \
-        --no-playlist \
-        --no-warnings \
-        -o "${fullAudioPath}" \
-        "${url}"`;
-      
-      exec(command, { 
-        maxBuffer: 150 * 1024 * 1024,
-        timeout: 180000 // 3 minute timeout
-      }, (error, stdout, stderr) => {
-        console.log(`yt-dlp output: ${stdout}`);
-        if (stderr) console.error(`yt-dlp stderr: ${stderr}`);
-        
-        if (error) {
-          console.error(`Attempt ${index + 1} failed:`, error.message);
-          reject(error);
-        } else if (fs.existsSync(fullAudioPath) && fs.statSync(fullAudioPath).size > 0) {
-          console.log(`Attempt ${index + 1} succeeded! File size: ${fs.statSync(fullAudioPath).size} bytes`);
-          resolve();
-        } else {
-          reject(new Error('File not created or is empty'));
-        }
+  try {
+    const { vimeoUrl, videoId: providedVideoId, startTime, endTime } = req.body;
+    
+    if (!vimeoUrl) {
+      return res.status(400).json({ 
+        error: 'Missing vimeoUrl',
+        details: 'vimeoUrl is required in request body'
       });
-    });
-  };
-
-  // Try each URL until one works
-  let downloadSuccess = false;
-  let lastError = null;
-
-  for (let i = 0; i < urlsToTry.length; i++) {
-    try {
-      await tryDownload(urlsToTry[i], i);
-      downloadSuccess = true;
-      break;
-    } catch (error) {
-      lastError = error;
-      // Clean up failed attempt
-      if (fs.existsSync(fullAudioPath)) {
-        fs.unlinkSync(fullAudioPath);
-      }
-      // Wait a bit before next attempt
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      continue;
     }
-  }
 
-  if (!downloadSuccess) {
-    console.error('All download attempts failed');
-    return res.status(500).json({
-      error: 'Failed to download audio from Vimeo',
-      details: lastError?.message || 'All methods failed',
-      triedUrls: urlsToTry,
-      videoId: videoId,
-      hasHash: !!hash
-    });
-  }
-
-  // Verify file exists and has content
-  if (!fs.existsSync(fullAudioPath)) {
-    return res.status(500).json({ error: 'Audio file was not created' });
-  }
-  
-  const fileSize = fs.statSync(fullAudioPath).size;
-  if (fileSize === 0) {
-    fs.unlinkSync(fullAudioPath);
-    return res.status(500).json({ error: 'Audio file is empty' });
-  }
-
-  console.log(`Audio downloaded successfully: ${(fileSize / (1024 * 1024)).toFixed(2)} MB`);
-
-  // If chunk parameters provided, extract chunk
-  if (startTime !== undefined && endTime !== undefined) {
-    const chunkPath = `/tmp/chunk_${videoId}_${startTime}_${endTime}_${timestamp}.mp3`;
-    const duration = endTime - startTime;
+    const videoId = providedVideoId || extractVideoId(vimeoUrl);
+    const hash = extractHash(vimeoUrl);
     
-    // Use more compatible FFmpeg options
-    const ffmpegCommand = `ffmpeg -ss ${startTime} -i "${fullAudioPath}" -t ${duration} -c:a libmp3lame -b:a 128k -ar 44100 "${chunkPath}" -y`;
-    
-    console.log(`Creating chunk: ${startTime}s to ${endTime}s (duration: ${duration}s)`);
-    
-    exec(ffmpegCommand, { 
-      maxBuffer: 100 * 1024 * 1024,
-      timeout: 60000 
-    }, (ffmpegError, ffmpegStdout, ffmpegStderr) => {
-      // Clean up full audio file
-      if (fs.existsSync(fullAudioPath)) {
-        fs.unlinkSync(fullAudioPath);
-      }
-
-      if (ffmpegError) {
-        console.error('FFmpeg error:', ffmpegError);
-        console.error('FFmpeg stderr:', ffmpegStderr);
-        return res.status(500).json({
-          error: 'Failed to create audio chunk',
-          details: ffmpegError.message
-        });
-      }
-
-      if (!fs.existsSync(chunkPath)) {
-        return res.status(500).json({ error: 'Audio chunk was not created' });
-      }
-      
-      const chunkStats = fs.statSync(chunkPath);
-      if (chunkStats.size === 0) {
-        fs.unlinkSync(chunkPath);
-        return res.status(500).json({ error: 'Audio chunk is empty' });
-      }
-      
-      const fileSizeInMB = (chunkStats.size / (1024 * 1024)).toFixed(2);
-      
-      console.log(`Chunk created successfully : ${fileSizeInMB} MB`);
-
-      res.download(chunkPath, `chunk_${videoId}_${startTime}_${endTime}.mp3`, (downloadErr) => {
-        if (fs.existsSync(chunkPath)) {
-          fs.unlinkSync(chunkPath);
-        }
-        
-        if (downloadErr) {
-          console.error('Chunk download error:', downloadErr);
-        } else {
-          console.log('Chunk sent successfully');
-        }
+    if (!videoId) {
+      return res.status(400).json({ 
+        error: 'Invalid Vimeo URL',
+        details: 'Could not extract video ID from URL',
+        url: vimeoUrl.substring(0, 100) + '...'
       });
-    });
+    }
 
-  } else {
-    // Send full audio
-    const stats = fs.statSync(fullAudioPath);
-    const fileSizeInMB = (stats.size / (1024 * 1024)).toFixed(2);
+    console.log(`Processing video ${videoId}${hash ? ' with hash ' + hash : ''}`);
     
-    console.log(`Sending full audio: ${fileSizeInMB} MB`);
+    const timestamp = Date.now();
+    const fullAudioPath = `/tmp/audio_${videoId}_${timestamp}.mp3`;
+    
+    // Vérifier que /tmp est accessible
+    try {
+      fs.accessSync('/tmp', fs.constants.W_OK);
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Storage not accessible',
+        details: 'Cannot write to /tmp directory'
+      });
+    }
 
-    res.download(fullAudioPath, `audio_${videoId}.mp3`, (err) => {
-      if (fs.existsSync(fullAudioPath)) {
-        fs.unlinkSync(fullAudioPath);
+    // URLs à essayer
+    const urlsToTry = [];
+    
+    if (hash) {
+      urlsToTry.push(`https://player.vimeo.com/video/${videoId}?h=${hash}`);
+      urlsToTry.push(vimeoUrl);
+    } else {
+      urlsToTry.push(vimeoUrl);
+    }
+    
+    urlsToTry.push(`https://vimeo.com/${videoId}`);
+    urlsToTry.push(`https://player.vimeo.com/video/${videoId}`);
+
+    // Téléchargement avec retry
+    let downloadSuccess = false;
+    let lastError = null;
+
+    for (let i = 0; i < urlsToTry.length; i++) {
+      try {
+        await attemptDownload(urlsToTry[i], fullAudioPath, i);
+        downloadSuccess = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        // Nettoyer les fichiers temporaires
+        if (fs.existsSync(fullAudioPath)) {
+          fs.unlinkSync(fullAudioPath);
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
       }
-      
-      if (err) {
-        console.error('Download error:', err);
-      } else {
-        console.log('Full audio sent successfully');
-      }
+    }
+
+    if (!downloadSuccess) {
+      return res.status(500).json({
+        error: 'Download failed',
+        details: lastError?.message || 'All download methods failed',
+        videoId: videoId
+      });
+    }
+
+    // Vérifier le fichier
+    if (!fs.existsSync(fullAudioPath) || fs.statSync(fullAudioPath).size === 0) {
+      return res.status(500).json({ 
+        error: 'Audio file creation failed',
+        details: 'File is empty or was not created'
+      });
+    }
+
+    console.log(`Audio downloaded successfully: ${(fs.statSync(fullAudioPath).size / (1024 * 1024)).toFixed(2)} MB`);
+
+    // Gérer les chunks ou le fichier complet
+    if (startTime !== undefined && endTime !== undefined) {
+      await handleAudioChunk(req, res, fullAudioPath, videoId, startTime, endTime, timestamp);
+    } else {
+      await handleFullAudio(req, res, fullAudioPath, videoId);
+    }
+
+  } catch (error) {
+    console.error('Unhandled error in download-audio:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
     });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    tmpDir: fs.existsSync('/tmp') ? 'accessible' : 'not accessible'
+// Fonction de téléchargement
+function attemptDownload(url, outputPath, attemptIndex) {
+  return new Promise((resolve, reject) => {
+    console.log(`Attempt ${attemptIndex + 1}: ${url.substring(0, 80)}...`);
+    
+    const command = `yt-dlp \
+      --no-check-certificate \
+      --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+      --referer "https://vimeo.com/" \
+      --retries 2 \
+      -x --audio-format mp3 \
+      --audio-quality 0 \
+      --no-playlist \
+      -o "${outputPath}" \
+      "${url}"`;
+    
+    exec(command, { 
+      maxBuffer: 50 * 1024 * 1024,
+      timeout: 120000
+    }, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+      } else if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+        resolve();
+      } else {
+        reject(new Error('Downloaded file is empty'));
+      }
+    });
+  });
+}
+
+// Gestion des chunks audio
+function handleAudioChunk(req, res, fullAudioPath, videoId, startTime, endTime, timestamp) {
+  const chunkPath = `/tmp/chunk_${videoId}_${startTime}_${endTime}_${timestamp}.mp3`;
+  const duration = endTime - startTime;
+  
+  const ffmpegCommand = `ffmpeg -ss ${startTime} -i "${fullAudioPath}" -t ${duration} -c copy "${chunkPath}" -y`;
+  
+  exec(ffmpegCommand, { timeout: 60000 }, (error) => {
+    // Cleanup original file
+    if (fs.existsSync(fullAudioPath)) {
+      fs.unlinkSync(fullAudioPath);
+    }
+
+    if (error || !fs.existsSync(chunkPath)) {
+      return res.status(500).json({
+        error: 'Chunk creation failed',
+        details: error?.message
+      });
+    }
+
+    res.download(chunkPath, `chunk_${videoId}_${startTime}_${endTime}.mp3`, (err) => {
+      if (fs.existsSync(chunkPath)) {
+        fs.unlinkSync(chunkPath);
+      }
+      if (err) console.error('Download error:', err);
+    });
+  });
+}
+
+// Gestion audio complet
+function handleFullAudio(req, res, fullAudioPath, videoId) {
+  res.download(fullAudioPath, `audio_${videoId}.mp3`, (err) => {
+    if (fs.existsSync(fullAudioPath)) {
+      fs.unlinkSync(fullAudioPath);
+    }
+    if (err) console.error('Download error:', err);
+  });
+}
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Global error handler:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    details: process.env.NODE_ENV === 'production' ? 'Something went wrong' : error.message
   });
 });
 
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    path: req.originalUrl
+  });
+});
+
+// Démarrage du serveur
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Vimeo Audio Downloader API v2.2.0 running on port ${PORT}`);
-  console.log(`Temp directory: ${fs.existsSync('/tmp') ? '/tmp accessible' : '/tmp NOT accessible'}`);
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Vimeo Audio Downloader API v2.2.1 running on port ${PORT}`);
+  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📁 Temp directory: ${fs.existsSync('/tmp') ? 'accessible' : 'NOT accessible'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully');
+  process.exit(0);
 });
