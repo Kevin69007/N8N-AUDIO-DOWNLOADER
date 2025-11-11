@@ -1,56 +1,65 @@
-// test.js
 import express from 'express';
-import { exec } from 'child_process';
-import fs from 'fs';
-import path from 'path';
 import { fileURLToPath } from 'url';
-import { tmpdir } from 'os';
+import { dirname, join } from 'path';
+import fs from 'fs';
+import { exec } from 'child_process';
+import { v4 as uuidv4 } from 'uuid';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json());
 
-app.get('/download', async (req, res) => {
-    const url = req.query.url;
+const downloadsFolder = join(__dirname, 'downloads');
 
-    if (!url) {
-        return res.status(400).send('URL manquante');
+// Créer le dossier downloads si n'existe pas
+if (!fs.existsSync(downloadsFolder)) {
+  fs.mkdirSync(downloadsFolder);
+}
+
+// Endpoint pour lancer le téléchargement
+app.post('/download-audio', (req, res) => {
+  const { url } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL manquante' });
+  }
+
+  const downloadId = uuidv4();
+  const outputPath = join(downloadsFolder, `${downloadId}.mp3`);
+
+  // Lancer le téléchargement en arrière-plan
+  exec(
+    `yt-dlp -x --audio-format mp3 -o "${outputPath}" "${url}"`,
+    (error, stdout, stderr) => {
+      if (error) {
+        console.error(`Erreur yt-dlp [${downloadId}]:`, error.message);
+        return;
+      }
+      console.log(`Téléchargement terminé [${downloadId}] : ${outputPath}`);
     }
+  );
 
-    try {
-        // Générer un fichier temporaire
-        const tmpFile = path.join(tmpdir(), `audio_${Date.now()}.m4a`);
-
-        // Commande yt-dlp
-        const cmd = `yt-dlp -f bestaudio -o "${tmpFile}" "${url}"`;
-
-        exec(cmd, (error, stdout, stderr) => {
-            if (error) {
-                console.error('Erreur yt-dlp :', stderr);
-                return res.status(500).send('Erreur lors du téléchargement');
-            }
-
-            // Envoyer le fichier au client
-            res.download(tmpFile, 'audio.m4a', (err) => {
-                if (err) {
-                    console.error('Erreur en envoyant le fichier :', err);
-                }
-
-                // Supprimer le fichier temporaire
-                fs.unlink(tmpFile, (unlinkErr) => {
-                    if (unlinkErr) console.error('Erreur en supprimant le fichier :', unlinkErr);
-                });
-            });
-        });
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Erreur interne');
-    }
+  // Répondre immédiatement au client avec l'ID
+  res.json({ downloadId, status: 'processing' });
 });
 
+// Endpoint pour récupérer le fichier si prêt
+app.get('/download-audio/:id', (req, res) => {
+  const { id } = req.params;
+  const filePath = join(downloadsFolder, `${id}.mp3`);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Fichier non disponible pour le moment' });
+  }
+
+  res.download(filePath, `${id}.mp3`, (err) => {
+    if (err) console.error('Erreur en envoyant le fichier:', err);
+  });
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Serveur lancé sur http://localhost:${PORT}`);
+  console.log(`Serveur démarré sur le port ${PORT}`);
 });
