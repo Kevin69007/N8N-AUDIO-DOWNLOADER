@@ -203,7 +203,7 @@ app.post('/download-audio', async (req, res) => {
       
       const fileSizeInMB = (chunkStats.size / (1024 * 1024)).toFixed(2);
       
-      console.log(`Chunk created successfully : ${fileSizeInMB} MB`);
+      console.log(`Chunk created successfully: ${fileSizeInMB} MB`);
 
       res.download(chunkPath, `chunk_${videoId}_${startTime}_${endTime}.mp3`, (downloadErr) => {
         if (fs.existsSync(chunkPath)) {
